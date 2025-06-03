@@ -6,4 +6,5 @@ seaborn
 xgboost
 lightgbm
 imbalanced-learn
+catboost
 -e .
