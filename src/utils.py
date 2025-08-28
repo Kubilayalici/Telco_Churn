@@ -18,14 +18,20 @@ class DataFrameUtils:
         print(self.dataframe.describe().T)
 
     def grab_col_names(self, cat_th=10, car_th=20):
-        """
-        Grab categorical and numerical column names based on thresholds.
-        """
-        categorical_cols = [col for col in self.dataframe.columns if self.dataframe[col].dtypes == 'O']
-        numerical_cols = [col for col in self.dataframe.columns if self.dataframe[col].dtypes in ['int64', 'float64']]
+        """Return (cat_cols, num_cols) with typical kaggle-style thresholds.
 
-        cat_cols = [col for col in categorical_cols if self.dataframe[col].nunique() < cat_th]
-        num_cols = [col for col in numerical_cols if self.dataframe[col].nunique() > car_th]
+        - cat_cols: object dtype + numeric columns with low cardinality (< cat_th), excluding high-cardinality categoricals (> car_th)
+        - num_cols: numeric dtype columns excluding those treated as categorical (num_but_cat)
+        """
+        df = self.dataframe
+        categorical_cols = [col for col in df.columns if df[col].dtypes == 'O']
+        numerical_cols = [col for col in df.columns if df[col].dtypes != 'O']
+
+        num_but_cat = [col for col in numerical_cols if df[col].nunique() < cat_th]
+        cat_but_car = [col for col in categorical_cols if df[col].nunique() > car_th]
+
+        cat_cols = [col for col in (categorical_cols + num_but_cat) if col not in cat_but_car]
+        num_cols = [col for col in numerical_cols if col not in num_but_cat]
 
         return cat_cols, num_cols
 
