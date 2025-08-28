@@ -4,15 +4,17 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 import joblib
 
-from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.model_selection import train_test_split, cross_val_score, GridSearchCV
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
 from sklearn.compose import ColumnTransformer
 from sklearn.metrics import (
     classification_report, confusion_matrix,
-    accuracy_score
+    accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
 )
+from pathlib import Path
+import json
 
 from sklearn.ensemble import (
     RandomForestClassifier, AdaBoostClassifier,
@@ -28,6 +30,9 @@ from xgboost import XGBClassifier
 from lightgbm import LGBMClassifier
 
 from src.utils import DataFrameUtils
+
+# Artifacts dir
+ARTIFACTS = Path("artifacts"); ARTIFACTS.mkdir(exist_ok=True)
 
 # Load and preprocess data
 df = pd.read_csv("notebook/data/Telco-Customer-Churn.csv")
@@ -66,41 +71,74 @@ def create_model(model, X_train, y_train):
 
 def evaluate_model(model, X_test, y_test):
     y_pred = model.predict(X_test)
+    # ROC-AUC with proba or decision scores
+    roc = None
+    if hasattr(model, 'predict_proba'):
+        try:
+            y_proba = model.predict_proba(X_test)[:, 1]
+            roc = roc_auc_score(y_test, y_proba)
+        except Exception:
+            roc = None
+    elif hasattr(model, 'decision_function'):
+        try:
+            y_score = model.decision_function(X_test)
+            roc = roc_auc_score(y_test, y_score)
+        except Exception:
+            roc = None
+
+    acc = accuracy_score(y_test, y_pred)
+    prec = precision_score(y_test, y_pred)
+    rec = recall_score(y_test, y_pred)
+    f1 = f1_score(y_test, y_pred)
+
     print(classification_report(y_test, y_pred))
     print(confusion_matrix(y_test, y_pred))
-    print("Accuracy:", accuracy_score(y_test, y_pred))
+    print({"accuracy": acc, "precision": prec, "recall": rec, "f1": f1, "roc_auc": roc})
+
+    with open(ARTIFACTS / 'metrics.json', 'w', encoding='utf-8') as f:
+        json.dump({"accuracy": acc, "precision": prec, "recall": rec, "f1": f1, "roc_auc": roc}, f, ensure_ascii=False, indent=2)
 
 def model_selection(X_train, y_train, X_test, y_test):
-    models = {
-        "RandomForest": RandomForestClassifier(),
-        "LogisticRegression": LogisticRegression(max_iter=1000),
-        "DecisionTree": DecisionTreeClassifier(),
-        "CatBoost": CatBoostClassifier(verbose=0, random_state=42),
-        "XGBoost": XGBClassifier(use_label_encoder=False, eval_metric='logloss'),
-        "LGBM": LGBMClassifier(),
-        "AdaBoost": AdaBoostClassifier(),
-        "ExtraTrees": ExtraTreesClassifier(),
-        "SVC": SVC(),
-        "KNeighbors": KNeighborsClassifier(),
-        "GaussianNB": GaussianNB()
+    grids = {
+        "RandomForest": (RandomForestClassifier(random_state=42), {
+            'classifier__n_estimators': [200, 400],
+            'classifier__max_depth': [None, 10, 20]
+        }),
+        "LogReg": (LogisticRegression(max_iter=1000), {
+            'classifier__C': [0.5, 1.0, 2.0],
+            'classifier__penalty': ['l2']
+        }),
+        "XGB": (XGBClassifier(use_label_encoder=False, eval_metric='logloss', n_estimators=300, learning_rate=0.1), {
+            'classifier__max_depth': [3, 5],
+            'classifier__subsample': [0.8, 1.0]
+        }),
+        "CatBoost": (CatBoostClassifier(verbose=0, random_state=42), {
+            'classifier__depth': [4, 6],
+            'classifier__iterations': [300, 600]
+        })
     }
 
     best_model = None
-    best_score = 0
+    best_name = None
+    best_cv = -np.inf
 
-    for name, model in models.items():
-        print(f"Training {name}...")
-        pipeline = create_model(model, X_train, y_train)
-        evaluate_model(pipeline, X_test, y_test)
+    for name, (clf, param_grid) in grids.items():
+        print(f"GridSearch {name}...")
+        pipe = Pipeline([
+            ("preprocessor", preprocessor),
+            ("classifier", clf)
+        ])
+        gs = GridSearchCV(pipe, param_grid=param_grid, cv=3, scoring='roc_auc', n_jobs=-1, verbose=0)
+        gs.fit(X_train, y_train)
+        print(f"{name} best CV ROC_AUC: {gs.best_score_:.4f}, params: {gs.best_params_}")
+        if gs.best_score_ > best_cv:
+            best_cv = gs.best_score_
+            best_model = gs.best_estimator_
+            best_name = name
 
-        score = cross_val_score(pipeline, X_train, y_train, cv=5).mean()
-        print(f"{name} Cross-Validation Score: {score:.4f}\n")
-
-        if score > best_score:
-            best_score = score
-            best_model = pipeline
-
-    print(f"Best Model: {best_model.named_steps['classifier'].__class__.__name__} with score: {best_score:.4f}")
+    print(f"Best Model: {best_name} | CV ROC_AUC: {best_cv:.4f}")
+    # Evaluate on test and persist metrics
+    evaluate_model(best_model, X_test, y_test)
     return best_model
 
 def feature_importance(model):
@@ -109,13 +147,13 @@ def feature_importance(model):
         feature_names = model.named_steps['preprocessor'].get_feature_names_out()
         importances = clf.feature_importances_
         indices = np.argsort(importances)[::-1]
-
         plt.figure(figsize=(12, 6))
         plt.title("Feature Importances")
-        plt.bar(range(len(importances)), importances[indices], align='center')
-        plt.xticks(range(len(importances)), [feature_names[i] for i in indices], rotation=90)
+        plt.bar(range(len(importances[:30])), importances[indices][:30], align='center')
+        plt.xticks(range(len(importances[:30])), [feature_names[i] for i in indices[:30]], rotation=90)
         plt.tight_layout()
-        plt.show()
+        plt.savefig(ARTIFACTS / 'feature_importance.png', dpi=150)
+        plt.close()
     else:
         print(f"{clf.__class__.__name__} does not support feature_importances_.")
 
